@@ -78,7 +78,13 @@ function instanceof_tfunc(@nospecialize(t))
     elseif isa(t, UnionAll)
         t′ = unwrap_unionall(t)
         t′′, isexact = instanceof_tfunc(t′)
-        return rewrap_unionall(t′′, t), isexact
+        tr = rewrap_unionall(t′′, t)
+        if t′′ isa DataType && !has_free_typevars(tr)
+            # a real instance must be within the declared bounds of the type,
+            # so we can intersect with the original wrapper.
+            tr = typeintersect(tr, t′′.name.wrapper)
+        end
+        return tr, isexact
     elseif isa(t, Union)
         ta, isexact_a = instanceof_tfunc(t.a)
         tb, isexact_b = instanceof_tfunc(t.b)
@@ -302,25 +308,25 @@ function sizeof_nothrow(@nospecialize(x))
     else
         x = widenconst(x)
     end
-    isconstType(x) && (x = x.parameters[1])
     if isa(x, Union)
         return sizeof_nothrow(x.a) && sizeof_nothrow(x.b)
     end
+    isconstType(x) && (x = x.parameters[1]) # since sizeof(typeof(x)) == sizeof(x)
     x === DataType && return false
-    return isconcretetype(x)
+    return isconcretetype(x) || isprimitivetype(x)
 end
 function _const_sizeof(@nospecialize(x))
     # Constant Vector does not have constant size
     isa(x, Vector) && return Int
     size = try
-        Core.sizeof(x)
-    catch ex
-        # Might return
-        # "argument is an abstract type; size is indeterminate" or
-        # "type does not have a fixed size"
-        isa(ex, ErrorException) || rethrow()
-        return Int
-    end
+            Core.sizeof(x)
+        catch ex
+            # Might return
+            # "argument is an abstract type; size is indeterminate" or
+            # "type does not have a fixed size"
+            isa(ex, ErrorException) || rethrow()
+            return Int
+        end
     return Const(size)
 end
 function sizeof_tfunc(@nospecialize(x),)
@@ -328,7 +334,11 @@ function sizeof_tfunc(@nospecialize(x),)
     isa(x, Conditional) && return _const_sizeof(Bool)
     isconstType(x) && return _const_sizeof(x.parameters[1])
     x = widenconst(x)
+    if isa(x, Union)
+        return tmerge(sizeof_tfunc(x.a), sizeof_tfunc(x.b))
+    end
     x !== DataType && isconcretetype(x) && return _const_sizeof(x)
+    isprimitivetype(x) && return _const_sizeof(x)
     return Int
 end
 add_tfunc(Core.sizeof, 1, 1, sizeof_tfunc, 0)
@@ -338,7 +348,7 @@ function nfields_tfunc(@nospecialize(x))
     x = widenconst(x)
     if isa(x, DataType) && !x.abstract && !(x.name === Tuple.name && isvatuple(x))
         if !(x.name === _NAMEDTUPLE_NAME && !isconcretetype(x))
-            return Const(length(x.types))
+            return Const(isdefined(x, :types) ? length(x.types) : length(x.name.names))
         end
     end
     return Int
@@ -431,7 +441,7 @@ function typeof_tfunc(@nospecialize(t))
     t = widenconst(t)
     if isType(t)
         tp = t.parameters[1]
-        if issingletontype(tp)
+        if hasuniquerep(tp)
             return Const(typeof(tp))
         end
     elseif isa(t, DataType)
@@ -588,7 +598,7 @@ function fieldcount_noerror(@nospecialize t)
     if abstr
         return nothing
     end
-    return length(t.types)
+    return isdefined(t, :types) ? length(t.types) : length(t.name.names)
 end
 
 
@@ -741,10 +751,27 @@ function getfield_tfunc(@nospecialize(s00), @nospecialize(name))
         return Any
     end
     if s.name === _NAMEDTUPLE_NAME && !isconcretetype(s)
-        # TODO: better approximate inference
-        return Any
+        if isa(name, Const) && isa(name.val, Symbol)
+            if isa(s.parameters[1], Tuple)
+                name = Const(Int(ccall(:jl_field_index, Cint, (Any, Any, Cint), s, name.val, false)+1))
+            else
+                name = Int
+            end
+        elseif Symbol ⊑ name
+            name = Int
+        end
+        _ts = s.parameters[2]
+        while isa(_ts, TypeVar)
+            _ts = _ts.ub
+        end
+        _ts = rewrap_unionall(_ts, s00)
+        if !(_ts <: Tuple)
+            return Any
+        end
+        return getfield_tfunc(_ts, name)
     end
-    if isempty(s.types)
+    ftypes = datatype_fieldtypes(s)
+    if isempty(ftypes)
         return Bottom
     end
     if isa(name, Conditional)
@@ -754,27 +781,27 @@ function getfield_tfunc(@nospecialize(s00), @nospecialize(name))
         if !(Int <: name || Symbol <: name)
             return Bottom
         end
-        if length(s.types) == 1
-            return rewrap_unionall(unwrapva(s.types[1]), s00)
+        if length(ftypes) == 1
+            return rewrap_unionall(unwrapva(ftypes[1]), s00)
         end
         # union together types of all fields
         t = Bottom
-        for _ft in s.types
+        for _ft in ftypes
             t = tmerge(t, rewrap_unionall(unwrapva(_ft), s00))
             t === Any && break
         end
         return t
     end
     fld = name.val
-    if isa(fld,Symbol)
+    if isa(fld, Symbol)
         fld = fieldindex(s, fld, false)
     end
-    if !isa(fld,Int)
+    if !isa(fld, Int)
         return Bottom
     end
-    nf = length(s.types)
-    if s <: Tuple && fld >= nf && isvarargtype(s.types[nf])
-        return rewrap_unionall(unwrapva(s.types[nf]), s00)
+    nf = length(ftypes)
+    if s <: Tuple && fld >= nf && isvarargtype(ftypes[nf])
+        return rewrap_unionall(unwrapva(ftypes[nf]), s00)
     end
     if fld < 1 || fld > nf
         return Bottom
@@ -790,7 +817,7 @@ function getfield_tfunc(@nospecialize(s00), @nospecialize(name))
         t = const_datatype_getfield_tfunc(sp, fld)
         t !== nothing && return t
     end
-    R = s.types[fld]
+    R = ftypes[fld]
     if isempty(s.parameters)
         return R
     end
@@ -843,7 +870,7 @@ function _fieldtype_nothrow(@nospecialize(s), exact::Bool, name::Const)
         fld = fieldindex(u, fld, false)
     end
     isa(fld, Int) || return false
-    ftypes = u.types
+    ftypes = datatype_fieldtypes(u)
     nf = length(ftypes)
     (fld >= 1 && fld <= nf) || return false
     if u.name === Tuple.name && fld >= nf && isvarargtype(ftypes[nf])
@@ -893,7 +920,7 @@ function _fieldtype_tfunc(@nospecialize(s), exact::Bool, @nospecialize(name))
         # TODO: better approximate inference
         return Type
     end
-    ftypes = u.types
+    ftypes = datatype_fieldtypes(u)
     if isempty(ftypes)
         return Bottom
     end
@@ -909,7 +936,7 @@ function _fieldtype_tfunc(@nospecialize(s), exact::Bool, @nospecialize(name))
             exactft1 = exact || (!has_free_typevars(ft1) && u.name !== Tuple.name)
             ft1 = rewrap_unionall(ft1, s)
             if exactft1
-                if issingletontype(ft1)
+                if hasuniquerep(ft1)
                     ft1 = Const(ft1) # ft unique via type cache
                 else
                     ft1 = Type{ft1}
@@ -942,7 +969,7 @@ function _fieldtype_tfunc(@nospecialize(s), exact::Bool, @nospecialize(name))
     exactft = exact || (!has_free_typevars(ft) && u.name !== Tuple.name)
     ft = rewrap_unionall(ft, s)
     if exactft
-        if issingletontype(ft)
+        if hasuniquerep(ft)
             return Const(ft) # ft unique via type cache
         end
         return Type{ft}
@@ -1036,7 +1063,7 @@ function apply_type_tfunc(@nospecialize(headtypetype), @nospecialize args...)
             ai = args[i]
             if isType(ai)
                 aty = ai.parameters[1]
-                allconst &= issingletontype(aty)
+                allconst &= hasuniquerep(aty)
             else
                 aty = (ai::Const).val
             end
@@ -1123,11 +1150,10 @@ end
 add_tfunc(apply_type, 1, INT_INF, apply_type_tfunc, 10)
 
 function invoke_tfunc(@nospecialize(ft), @nospecialize(types), @nospecialize(argtype), sv::InferenceState)
-    argument_mt(ft) === nothing && return Any
     argtype = typeintersect(types, argtype)
-    if argtype === Bottom
-        return Bottom
-    end
+    argtype === Bottom && return Bottom
+    argtype isa DataType || return Any # other cases are not implemented below
+    isdispatchelem(ft) || return Any # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
     types = rewrap_unionall(Tuple{ft, unwrap_unionall(types).parameters...}, types)
     argtype = Tuple{ft, argtype.parameters...}
     entry = ccall(:jl_gf_invoke_lookup, Any, (Any, UInt), types, sv.params.world)
@@ -1170,7 +1196,7 @@ function tuple_tfunc(atypes::Vector{Any})
             x = widenconst(x)
             if isType(x)
                 xparam = x.parameters[1]
-                if issingletontype(xparam) || xparam === Bottom
+                if hasuniquerep(xparam) || xparam === Bottom
                     params[i] = typeof(xparam)
                 else
                     params[i] = Type
@@ -1425,7 +1451,7 @@ function return_type_tfunc(argtypes::Vector{Any}, vtypes::VarTable, sv::Inferenc
                     if isa(rt, Const)
                         # output was computed to be constant
                         return Const(typeof(rt.val))
-                    elseif issingletontype(rt) || rt === Bottom
+                    elseif hasuniquerep(rt) || rt === Bottom
                         # output type was known for certain
                         return Const(rt)
                     elseif (isa(tt, Const) || isconstType(tt)) &&

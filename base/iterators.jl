@@ -12,7 +12,7 @@ using .Base:
     @inline, Pair, AbstractDict, IndexLinear, IndexCartesian, IndexStyle, AbstractVector, Vector,
     tail, tuple_type_head, tuple_type_tail, tuple_type_cons, SizeUnknown, HasLength, HasShape,
     IsInfinite, EltypeUnknown, HasEltype, OneTo, @propagate_inbounds, Generator, AbstractRange,
-    LinearIndices, (:), |, +, -, !==, !, <=, <, missing, map, any
+    LinearIndices, (:), |, +, -, !==, !, <=, <, missing, map, any, @boundscheck, @inbounds
 
 import .Base:
     first, last,
@@ -22,7 +22,7 @@ import .Base:
     getindex, setindex!, get, iterate,
     popfirst!, isdone, peek
 
-export enumerate, zip, rest, countfrom, take, drop, cycle, repeated, product, flatten, partition
+export enumerate, zip, rest, countfrom, take, drop, takewhile, dropwhile, cycle, repeated, product, flatten, partition
 
 tail_if_any(::Tuple{}) = ()
 tail_if_any(x::Tuple) = tail(x)
@@ -98,6 +98,7 @@ reverse(G::Generator) = Generator(G.f, reverse(G.iter))
 reverse(r::Reverse) = r.itr
 reverse(x::Union{Number,AbstractChar}) = x
 reverse(p::Pair) = Base.reverse(p) # copying pairs is cheap
+reverse(xs::Tuple) = Base.reverse(xs) # allows inference in mapfoldr and similar
 
 iterate(r::Reverse{<:Tuple}, i::Int = length(r.itr)) = i < 1 ? nothing : (r.itr[i], i-1)
 
@@ -270,8 +271,9 @@ end
 Run multiple iterators at the same time, until any of them is exhausted. The value type of
 the `zip` iterator is a tuple of values of its subiterators.
 
-Note: `zip` orders the calls to its subiterators in such a way that stateful iterators will
-not advance when another iterator finishes in the current iteration.
+!!! note
+    `zip` orders the calls to its subiterators in such a way that stateful iterators will
+    not advance when another iterator finishes in the current iteration.
 
 # Examples
 ```jldoctest
@@ -648,6 +650,105 @@ end
 iterate(it::Drop, state) = iterate(it.xs, state)
 isdone(it::Drop, state) = isdone(it.xs, state)
 
+
+# takewhile
+
+struct TakeWhile{I,P<:Function}
+    pred::P
+    xs::I
+end
+
+"""
+    takewhile(pred, iter)
+
+An iterator that generates element from `iter` as long as predicate `pred` is true,
+afterwards, drops every element.
+
+!!! compat "Julia 1.4"
+    This function requires at least Julia 1.4.
+
+# Examples
+
+```jldoctest
+julia> s = collect(1:5)
+5-element Array{Int64,1}:
+ 1
+ 2
+ 3
+ 4
+ 5
+
+julia> collect(Iterators.takewhile(<(3),s))
+2-element Array{Int64,1}:
+ 1
+ 2
+```
+"""
+takewhile(pred,xs) = TakeWhile(pred,xs)
+
+function iterate(ibl::TakeWhile, itr...)
+    y = iterate(ibl.xs,itr...)
+    y === nothing && return nothing
+    ibl.pred(y[1]) || return nothing
+    y
+end
+
+IteratorSize(::Type{<:TakeWhile}) = SizeUnknown()
+eltype(::Type{TakeWhile{I,P}}) where {I,P} = eltype(I)
+IteratorEltype(::Type{TakeWhile{I,P}}) where {I,P} = IteratorEltype(I)
+
+
+# dropwhile
+
+struct DropWhile{I,P<:Function}
+    pred::P
+    xs::I
+end
+
+"""
+    dropwhile(pred, iter)
+
+An iterator that drops element from `iter` as long as predicate `pred` is true,
+afterwards, returns every element.
+
+!!! compat "Julia 1.4"
+    This function requires at least Julia 1.4.
+
+# Examples
+
+```jldoctest
+julia> s = collect(1:5)
+5-element Array{Int64,1}:
+ 1
+ 2
+ 3
+ 4
+ 5
+
+julia> collect(Iterators.dropwhile(<(3),s))
+3-element Array{Int64,1}:
+ 3
+ 4
+ 5
+```
+"""
+dropwhile(pred,itr) = DropWhile(pred,itr)
+
+iterate(ibl::DropWhile,itr) = iterate(ibl.xs, itr)
+function iterate(ibl::DropWhile)
+    y = iterate(ibl.xs)
+    while y !== nothing
+        ibl.pred(y[1]) || break
+        y = iterate(ibl.xs,y[2])
+    end
+    y
+end
+
+IteratorSize(::Type{<:DropWhile}) = SizeUnknown()
+eltype(::Type{DropWhile{I,P}}) where {I,P} = eltype(I)
+IteratorEltype(::Type{DropWhile{I,P}}) where {I,P} = IteratorEltype(I)
+
+
 # Cycle an iterator forever
 
 struct Cycle{I}
@@ -929,7 +1030,6 @@ julia> collect(Iterators.partition([1,2,3,4,5], 2))
 """
 partition(c::T, n::Integer) where {T} = PartitionIterator{T}(c, Int(n))
 
-
 struct PartitionIterator{T}
     c::T
     n::Int
@@ -990,7 +1090,7 @@ There are several different ways to think about this iterator wrapper:
    whenever an item is produced.
 
 `Stateful` provides the regular iterator interface. Like other mutable iterators
-(e.g. [`Channel`](@ref)), if iteration is stopped early (e.g. by a `break` in a `for` loop),
+(e.g. [`Channel`](@ref)), if iteration is stopped early (e.g. by a [`break`](@ref) in a [`for`](@ref) loop),
 iteration can be resumed from the same spot by continuing to iterate over the
 same iterator object (in contrast, an immutable iterator would restart from the
 beginning).
@@ -1094,5 +1194,42 @@ IteratorSize(::Type{Stateful{T,VS}}) where {T,VS} = IteratorSize(T) isa HasShape
 eltype(::Type{Stateful{T, VS}} where VS) where {T} = eltype(T)
 IteratorEltype(::Type{Stateful{T,VS}}) where {T,VS} = IteratorEltype(T)
 length(s::Stateful) = length(s.itr) - s.taken
+
+"""
+    only(x)
+
+Returns the one and only element of collection `x`, and throws an `ArgumentError` if the
+collection has zero or multiple elements.
+
+See also: [`first`](@ref), [`last`](@ref).
+
+!!! compat "Julia 1.4"
+    This method requires at least Julia 1.4.
+"""
+@propagate_inbounds function only(x)
+    i = iterate(x)
+    @boundscheck if i === nothing
+        throw(ArgumentError("Collection is empty, must contain exactly 1 element"))
+    end
+    (ret, state) = i
+    @boundscheck if iterate(x, state) !== nothing
+        throw(ArgumentError("Collection has multiple elements, must contain exactly 1 element"))
+    end
+    return ret
+end
+
+# Collections of known size
+only(x::Ref) = x[]
+only(x::Number) = x
+only(x::Char) = x
+only(x::Tuple{Any}) = x[1]
+only(x::Tuple) = throw(
+    ArgumentError("Tuple contains $(length(x)) elements, must contain exactly 1 element")
+)
+only(a::AbstractArray{<:Any, 0}) = @inbounds return a[]
+only(x::NamedTuple{<:Any, <:Tuple{Any}}) = first(x)
+only(x::NamedTuple) = throw(
+    ArgumentError("NamedTuple contains $(length(x)) elements, must contain exactly 1 element")
+)
 
 end

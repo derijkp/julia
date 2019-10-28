@@ -1,9 +1,10 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 struct InvokeData
-    mt::Core.MethodTable
     entry::Core.TypeMapEntry
     types0
+    min_valid::UInt
+    max_valid::UInt
 end
 
 struct Signature
@@ -581,9 +582,9 @@ function spec_lambda(@nospecialize(atype), sv::OptimizationState, @nospecialize(
     else
         invoke_data = invoke_data::InvokeData
         atype <: invoke_data.types0 || return nothing
-        mi = ccall(:jl_get_invoke_lambda, Any, (Any, Any, Any, UInt),
-                invoke_data.mt, invoke_data.entry, atype, sv.params.world)
-        #XXX: compute min/max_valid
+        mi = ccall(:jl_get_invoke_lambda, Any, (Any, Any), invoke_data.entry, atype)
+        min_valid[1] = invoke_data.min_valid
+        max_valid[1] = invoke_data.max_valid
     end
     mi !== nothing && add_backedge!(mi::MethodInstance, sv)
     update_valid_age!(min_valid[1], max_valid[1], sv)
@@ -591,11 +592,11 @@ function spec_lambda(@nospecialize(atype), sv::OptimizationState, @nospecialize(
 end
 
 # This assumes the caller has verified that all arguments to the _apply call are Tuples.
-function rewrite_apply_exprargs!(ir::IRCode, idx::Int, argexprs::Vector{Any}, atypes::Vector{Any})
-    new_argexprs = Any[argexprs[2]]
-    new_atypes = Any[atypes[2]]
+function rewrite_apply_exprargs!(ir::IRCode, idx::Int, argexprs::Vector{Any}, atypes::Vector{Any}, arg_start::Int)
+    new_argexprs = Any[argexprs[arg_start]]
+    new_atypes = Any[atypes[arg_start]]
     # loop over original arguments and flatten any known iterators
-    for i in 3:length(argexprs)
+    for i in (arg_start+1):length(argexprs)
         def = argexprs[i]
         def_type = atypes[i]
         if def_type isa PartialStruct
@@ -662,7 +663,7 @@ function analyze_method!(idx::Int, sig::Signature, @nospecialize(metharg), meths
     methsig = method.sig
 
     # Check whether this call just evaluates to a constant
-    if isa(f, widenconst(ft)) && !isdefined(method, :generator) && method.pure &&
+    if isa(f, widenconst(ft)) &&
             isa(stmttyp, Const) && stmttyp.actual && is_inlineable_constant(stmttyp.val)
         return ConstantCase(quoted(stmttyp.val), method, Any[methsp...], metharg)
     end
@@ -881,11 +882,12 @@ end
 
 function inline_apply!(ir::IRCode, idx::Int, sig::Signature, params::Params)
     stmt = ir.stmts[idx]
-    while sig.f === Core._apply
+    while sig.f === Core._apply || sig.f === Core._apply_iterate
+        arg_start = sig.f === Core._apply ? 2 : 3
         atypes = sig.atypes
         # Try to figure out the signature of the function being called
         # and if rewrite_apply_exprargs can deal with this form
-        for i = 3:length(atypes)
+        for i = (arg_start + 1):length(atypes)
             # TODO: We could basically run the iteration protocol here
             if !is_valid_type_for_apply_rewrite(atypes[i], params)
                 return nothing
@@ -893,13 +895,13 @@ function inline_apply!(ir::IRCode, idx::Int, sig::Signature, params::Params)
         end
         # Independent of whether we can inline, the above analysis allows us to rewrite
         # this apply call to a regular call
-        ft = atypes[2]
-        if length(atypes) == 3 && ft isa Const && ft.val === Core.tuple && atypes[3] ⊑ Tuple
+        ft = atypes[arg_start]
+        if length(atypes) == arg_start+1 && ft isa Const && ft.val === Core.tuple && atypes[arg_start+1] ⊑ Tuple
             # rewrite `((t::Tuple)...,)` to `t`
-            ir.stmts[idx] = stmt.args[3]
+            ir.stmts[idx] = stmt.args[arg_start+1]
             return nothing
         end
-        stmt.args, atypes = rewrite_apply_exprargs!(ir, idx, stmt.args, atypes)
+        stmt.args, atypes = rewrite_apply_exprargs!(ir, idx, stmt.args, atypes, arg_start)
         has_free_typevars(ft) && return nothing
         f = singleton_type(ft)
         sig = Signature(f, ft, atypes)
@@ -924,6 +926,7 @@ function inline_invoke!(ir::IRCode, idx::Int, sig::Signature, invoke_data::Invok
     result = analyze_method!(idx, sig, metharg, methsp, method, stmt, sv, true, invoke_data,
                              calltype)
     handle_single_case!(ir, stmt, idx, result, true, todo, sv)
+    update_valid_age!(invoke_data.min_valid, invoke_data.max_valid, sv)
     return nothing
 end
 
@@ -1109,26 +1112,26 @@ end
 
 function compute_invoke_data(@nospecialize(atypes), params::Params)
     ft = widenconst(atypes[2])
-    invoke_tt = widenconst(atypes[3])
-    mt = argument_mt(ft)
-    if mt === nothing || !isType(invoke_tt) || has_free_typevars(invoke_tt) ||
-            has_free_typevars(ft) || (ft <: Builtin)
+    if !isdispatchelem(ft) || has_free_typevars(ft) || (ft <: Builtin)
         # TODO: this can be rather aggressive at preventing inlining of closures
-        # XXX: this is wrong for `ft <: Type`, since we are failing to check that
-        #      the result doesn't have subtypes, or to do an intersection lookup
+        # but we need to check that `ft` can't have a subtype at runtime before using the supertype lookup below
         return nothing
     end
-    if !(isa(invoke_tt.parameters[1], Type) &&
-            invoke_tt.parameters[1] <: Tuple)
+    invoke_tt = widenconst(atypes[3])
+    if !isType(invoke_tt) || has_free_typevars(invoke_tt)
         return nothing
     end
     invoke_tt = invoke_tt.parameters[1]
+    if !(isa(unwrap_unionall(invoke_tt), DataType) && invoke_tt <: Tuple)
+        return nothing
+    end
     invoke_types = rewrap_unionall(Tuple{ft, unwrap_unionall(invoke_tt).parameters...}, invoke_tt)
+    min_valid = UInt[typemin(UInt)]
+    max_valid = UInt[typemax(UInt)]
     invoke_entry = ccall(:jl_gf_invoke_lookup, Any, (Any, UInt),
-                         invoke_types, params.world)
+                         invoke_types, params.world) # XXX: min_valid, max_valid
     invoke_entry === nothing && return nothing
-    #XXX: update_valid_age!(min_valid[1], max_valid[1], sv)
-    invoke_data = InvokeData(mt, invoke_entry, invoke_types)
+    invoke_data = InvokeData(invoke_entry::Core.TypeMapEntry, invoke_types, min_valid[1], max_valid[1])
     atype0 = atypes[2]
     atypes = atypes[4:end]
     pushfirst!(atypes, atype0)

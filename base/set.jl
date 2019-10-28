@@ -373,7 +373,7 @@ function allunique(C)
     true
 end
 
-allunique(::Set) = true
+allunique(::Union{AbstractSet,AbstractDict}) = true
 
 allunique(r::AbstractRange{T}) where {T} = (step(r) != zero(T)) || (length(r) <= 1)
 allunique(r::StepRange{T,S}) where {T,S} = (step(r) != zero(S)) || (length(r) <= 1)
@@ -533,8 +533,6 @@ promote_valuetype(x::Pair{K, V}, y::Pair...) where {K, V} =
     promote_type(V, promote_valuetype(y...))
 
 # Subtract singleton types which are going to be replaced
-@pure issingletontype(T::DataType) = isdefined(T, :instance)
-issingletontype(::Type) = false
 function subtract_singletontype(::Type{T}, x::Pair{K}) where {T, K}
     if issingletontype(K)
         Core.Compiler.typesubtract(T, K)

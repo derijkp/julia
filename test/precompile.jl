@@ -144,11 +144,11 @@ try
                               missing, missing, missing,
                               missing, missing, 6]
 
-              let some_method = which(Base.include, (String,))
+              let some_method = which(Base.include, (Module, String,))
                     # global const some_method // FIXME: support for serializing a direct reference to an external Method not implemented
                   global const some_linfo =
                       ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance}, (Any, Any, Any, UInt),
-                          some_method, Tuple{typeof(Base.include), String}, Core.svec(), typemax(UInt))
+                          some_method, Tuple{typeof(Base.include), Module, String}, Core.svec(), typemax(UInt))
               end
 
               g() = override(1.0)
@@ -287,19 +287,20 @@ try
                 Val{3},
                 Val{nothing}},
             0:25)
-        some_method = which(Base.include, (String,))
+        some_method = which(Base.include, (Module, String,))
         some_linfo =
                 ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance}, (Any, Any, Any, UInt),
-                    some_method, Tuple{typeof(Base.include), String}, Core.svec(), typemax(UInt))
+                    some_method, Tuple{typeof(Base.include), Module, String}, Core.svec(), typemax(UInt))
         @test Foo.some_linfo::Core.MethodInstance === some_linfo
 
-        PV = Foo.Value18343{Some}.body.types[1]
-        VR = PV.types[1].parameters[1]
-        @test PV.types[1] === Array{VR,1}
-        @test pointer_from_objref(PV.types[1]) ===
-              pointer_from_objref(PV.types[1].parameters[1].types[1].types[1])
-        @test PV === PV.types[1].parameters[1].types[1]
-        @test pointer_from_objref(PV) === pointer_from_objref(PV.types[1].parameters[1].types[1])
+        ft = Base.datatype_fieldtypes
+        PV = ft(Foo.Value18343{Some}.body)[1]
+        VR = ft(PV)[1].parameters[1]
+        @test ft(PV)[1] === Array{VR,1}
+        @test pointer_from_objref(ft(PV)[1]) ===
+              pointer_from_objref(ft(ft(ft(PV)[1].parameters[1])[1])[1])
+        @test PV === ft(ft(PV)[1].parameters[1])[1]
+        @test pointer_from_objref(PV) === pointer_from_objref(ft(ft(PV)[1].parameters[1])[1])
     end
 
     Baz_file = joinpath(dir, "Baz.jl")
@@ -331,7 +332,8 @@ try
           end
           """)
 
-    Base.compilecache(Base.PkgId("FooBar"))
+    cachefile = Base.compilecache(Base.PkgId("FooBar"))
+    @test cachefile == Base.compilecache_path(Base.PkgId("FooBar"))
     @test isfile(joinpath(cachedir, "FooBar.ji"))
     @test Base.stale_cachefile(FooBar_file, joinpath(cachedir, "FooBar.ji")) isa Vector
     @test !isdefined(Main, :FooBar)
@@ -371,13 +373,13 @@ try
           error("break me")
           end
           """)
-    @test_warn r"ERROR: Error while loading expression starting at.*FooBar2.*caused by.*break me"s try
-        Base.require(Main, :FooBar2)
-        error("\"LoadError: break me\" test failed")
-    catch exc
-        isa(exc, ErrorException) || rethrow()
-        occursin("ERROR: LoadError: break me", exc.msg) && rethrow()
-    end
+    @test_warn "ERROR: LoadError: break me\nStacktrace:\n [1] error" try
+            Base.require(Main, :FooBar2)
+            error("the \"break me\" test failed")
+        catch exc
+            isa(exc, ErrorException) || rethrow()
+            occursin("ERROR: LoadError: break me", exc.msg) && rethrow()
+        end
 
     # Test transitive dependency for #21266
     FooBarT_file = joinpath(dir, "FooBarT.jl")

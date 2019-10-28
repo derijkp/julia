@@ -211,16 +211,17 @@ end
 
 ### Cross-building Julia without Vagrant
 
-If you don't care that the build is potentially incompatible with the WinRPM
-ecosystem (or happen to be on opensuse), use the following steps to cross-
-compile julia:
+Alternatively, if you want to build it on the local system,
+use the following steps to cross-compile julia:
 
 First, you will need to ensure your system has the required dependencies.  We
 need wine (>=1.7.5), a system compiler, and some downloaders.
 
 **On Ubuntu** (on other linux systems, the dependency names are likely to be similar):
 ```sh
-apt-get install wine subversion cvs gcc wget p7zip-full winbind mingw-w64
+apt-get install wine-stable gcc wget p7zip-full winbind mingw-w64 gfortran-mingw-w64
+# switch all of the following to their "-posix" variants (interactively):
+for pkg in i686-w64-mingw32-g++ i686-w64-mingw32-gcc i686-w64-mingw32-gfortran x86_64-w64-mingw32-g++ x86_64-w64-mingw32-gcc x86_64-w64-mingw32-gfortran; do sudo update-alternatives --config $pkg; done
 ```
 
 **On Mac**: Install XCode, XCode command line tools, X11 (now [XQuartz](
@@ -244,9 +245,9 @@ in 32-bit mode).
 
 ## Debugging a cross-compiled build under wine
 
-The most effective way to debug a cross-compiled version of julia on the cross-
-compilation host is to install a windows version of gdb and run it under wine as
-usual. The pre-built packages available [as part of the MSYS2 project](
+The most effective way to debug a cross-compiled version of julia on the
+cross-compilation host is to install a windows version of gdb and run it under wine
+as usual. The pre-built packages available [as part of the MSYS2 project](
 https://sourceforge.net/projects/msys2/files/REPOS/MINGW/) are known to work.
 Apart from the GDB package you may also need the python and termcap packages.
 Finally, GDB's prompt may not work when launch from the command line. This can
@@ -256,7 +257,8 @@ be worked around by prepending `wineconsole` to the regular GDB invocation.
 ## Using a Windows VM
 
 [Vagrant](https://www.vagrantup.com/downloads.html) can also be used with a Windows
-guest VM via the `Vagrantfile` in [contrib/windows](contrib/windows/Vagrantfile),
+guest VM via the `Vagrantfile` in [contrib/windows](
+https://github.com/JuliaLang/julia/blob/master/contrib/windows/Vagrantfile),
 just run `vagrant up` from that folder.
 
 

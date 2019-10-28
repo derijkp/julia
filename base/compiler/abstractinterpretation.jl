@@ -19,7 +19,7 @@ call_result_unused(frame::InferenceState, pc::LineNum=frame.currpc) =
 function abstract_call_gf_by_type(@nospecialize(f), argtypes::Vector{Any}, @nospecialize(atype), sv::InferenceState,
                                   max_methods = sv.params.MAX_METHODS)
     atype_params = unwrap_unionall(atype).parameters
-    ft = unwrap_unionall(atype_params[1]) # TODO: ccall jl_first_argument_datatype here
+    ft = unwrap_unionall(atype_params[1]) # TODO: ccall jl_method_table_for here
     isa(ft, DataType) || return Any # the function being called is unknown. can't properly handle this backedge right now
     ftname = ft.name
     isdefined(ftname, :mt) || return Any # not callable. should be Bottom, but can't track this backedge right now
@@ -187,12 +187,32 @@ function abstract_call_method_with_const_args(@nospecialize(rettype), @nospecial
         end
     end
     haveconst || improvable_via_constant_propagation(rettype) || return Any
-    sig = match[1]
-    sparams = match[2]::SimpleVector
+    if nargs > 1
+        if istopfunction(f, :getindex) || istopfunction(f, :setindex!)
+            arrty = argtypes[2]
+            # don't propagate constant index into indexing of non-constant array
+            if arrty isa Type && arrty <: AbstractArray && !issingletontype(arrty)
+                return Any
+            end
+        elseif istopfunction(f, :iterate)
+            itrty = argtypes[2]
+            if itrty isa Type && !issingletontype(itrty)
+                return Any
+            end
+        end
+    end
+    if !allconst && (istopfunction(f, :+) || istopfunction(f, :-) || istopfunction(f, :*) ||
+                     istopfunction(f, :(==)) || istopfunction(f, :!=) ||
+                     istopfunction(f, :<=) || istopfunction(f, :>=) || istopfunction(f, :<) || istopfunction(f, :>) ||
+                     istopfunction(f, :<<) || istopfunction(f, :>>))
+        return Any
+    end
     force_inference = allconst || sv.params.aggressive_constant_propagation
     if istopfunction(f, :getproperty) || istopfunction(f, :setproperty!)
         force_inference = true
     end
+    sig = match[1]
+    sparams = match[2]::SimpleVector
     mi = specialize_method(method, sig, sparams, !force_inference)
     mi === nothing && return Any
     mi = mi::MethodInstance
@@ -258,7 +278,7 @@ function abstract_call_method(method::Method, @nospecialize(sig), sparams::Simpl
                     # we have a self-cycle in the call-graph, but not in the inference graph (typically):
                     # break this edge now (before we record it) by returning early
                     # (non-typically, this means that we lose the ability to detect a guaranteed StackOverflow in some cases)
-                    return Any, false, nothing
+                    return Any, true, nothing
                 end
                 topmost = nothing
                 edgecycle = true
@@ -339,7 +359,7 @@ function abstract_call_method(method::Method, @nospecialize(sig), sparams::Simpl
                 # since it's very unlikely that we'll try to inline this,
                 # or want make an invoke edge to its calling convention return type.
                 # (non-typically, this means that we lose the ability to detect a guaranteed StackOverflow in some cases)
-                return Any, false, nothing
+                return Any, true, nothing
             end
             poison_callstack(sv, topmost::InferenceState, true)
             sig = newsig
@@ -407,7 +427,7 @@ end
 # refine its type to an array of element types.
 # Union of Tuples of the same length is converted to Tuple of Unions.
 # returns an array of types
-function precise_container_type(@nospecialize(typ), vtypes::VarTable, sv::InferenceState)
+function precise_container_type(@nospecialize(itft), @nospecialize(typ), vtypes::VarTable, sv::InferenceState)
     if isa(typ, PartialStruct) && typ.typ.name === Tuple.name
         return typ.fields
     end
@@ -422,10 +442,13 @@ function precise_container_type(@nospecialize(typ), vtypes::VarTable, sv::Infere
     tti0 = widenconst(typ)
     tti = unwrap_unionall(tti0)
     if isa(tti, DataType) && tti.name === NamedTuple_typename
-        tti0 = tti.parameters[2]
-        while isa(tti0, TypeVar)
-            tti0 = tti0.ub
+        # A NamedTuple iteration is the the same as the iteration of its Tuple parameter:
+        # compute a new `tti == unwrap_unionall(tti0)` based on that Tuple type
+        tti = tti.parameters[2]
+        while isa(tti, TypeVar)
+            tti = tti.ub
         end
+        tti0 = rewrap_unionall(tti, tti0)
     end
     if isa(tti, Union)
         utis = uniontypes(tti)
@@ -466,17 +489,24 @@ function precise_container_type(@nospecialize(typ), vtypes::VarTable, sv::Infere
     elseif tti0 <: Array
         return Any[Vararg{eltype(tti0)}]
     else
-        return abstract_iteration(typ, vtypes, sv)
+        return abstract_iteration(itft, typ, vtypes, sv)
     end
 end
 
 # simulate iteration protocol on container type up to fixpoint
-function abstract_iteration(@nospecialize(itertype), vtypes::VarTable, sv::InferenceState)
+function abstract_iteration(@nospecialize(itft), @nospecialize(itertype), vtypes::VarTable, sv::InferenceState)
     if !isdefined(Main, :Base) || !isdefined(Main.Base, :iterate) || !isconst(Main.Base, :iterate)
         return Any[Vararg{Any}]
     end
-    iteratef = getfield(Main.Base, :iterate)
-    stateordonet = abstract_call(iteratef, nothing, Any[Const(iteratef), itertype], vtypes, sv)
+    if itft === nothing
+        iteratef = getfield(Main.Base, :iterate)
+        itft = Const(iteratef)
+    elseif isa(itft, Const)
+        iteratef = itft.val
+    else
+        return Any[Vararg{Any}]
+    end
+    stateordonet = abstract_call(iteratef, nothing, Any[itft, itertype], vtypes, sv)
     # Return Bottom if this is not an iterator.
     # WARNING: Changes to the iteration protocol must be reflected here,
     # this is not just an optimization.
@@ -520,7 +550,7 @@ function abstract_iteration(@nospecialize(itertype), vtypes::VarTable, sv::Infer
 end
 
 # do apply(af, fargs...), where af is a function value
-function abstract_apply(@nospecialize(aft), aargtypes::Vector{Any}, vtypes::VarTable, sv::InferenceState,
+function abstract_apply(@nospecialize(itft), @nospecialize(aft), aargtypes::Vector{Any}, vtypes::VarTable, sv::InferenceState,
                         max_methods = sv.params.MAX_METHODS)
     aftw = widenconst(aft)
     if !isa(aft, Const) && (!isType(aftw) || has_free_typevars(aftw))
@@ -538,7 +568,7 @@ function abstract_apply(@nospecialize(aft), aargtypes::Vector{Any}, vtypes::VarT
     for i = 1:nargs
         ctypes´ = []
         for ti in (splitunions ? uniontypes(aargtypes[i]) : Any[aargtypes[i]])
-            cti = precise_container_type(ti, vtypes, sv)
+            cti = precise_container_type(itft, ti, vtypes, sv)
             if _any(t -> t === Bottom, cti)
                 continue
             end
@@ -547,7 +577,7 @@ function abstract_apply(@nospecialize(aft), aargtypes::Vector{Any}, vtypes::VarT
                     tail = tuple_tail_elem(unwrapva(ct[end]), cti)
                     push!(ctypes´, push!(ct[1:(end - 1)], tail))
                 else
-                    push!(ctypes´, append_any(ct, cti))
+                    push!(ctypes´, append!(ct[:], cti))
                 end
             end
         end
@@ -585,9 +615,17 @@ function pure_eval_call(@nospecialize(f), argtypes::Vector{Any}, @nospecialize(a
         return false
     end
     meth = meth[1]::SimpleVector
+    sig = meth[1]::DataType
+    sparams = meth[2]::SimpleVector
     method = meth[3]::Method
-    # TODO: check pure on the inferred thunk
-    if isdefined(method, :generator) || !method.pure
+
+    if isdefined(method, :generator)
+        method.generator.expand_early || return false
+        mi = specialize_method(method, sig, sparams, false)
+        isa(mi, MethodInstance) || return false
+        staged = get_staged(mi)
+        (staged isa CodeInfo && (staged::CodeInfo).pure) || return false
+    elseif !method.pure
         return false
     end
 
@@ -603,7 +641,9 @@ end
 
 function abstract_call(@nospecialize(f), fargs::Union{Nothing,Vector{Any}}, argtypes::Vector{Any}, vtypes::VarTable, sv::InferenceState, max_methods = sv.params.MAX_METHODS)
     if f === _apply
-        return abstract_apply(argtypes[2], argtypes[3:end], vtypes, sv, max_methods)
+        return abstract_apply(nothing, argtypes[2], argtypes[3:end], vtypes, sv, max_methods)
+    elseif f === _apply_iterate
+        return abstract_apply(argtypes[2], argtypes[3], argtypes[4:end], vtypes, sv, max_methods)
     end
 
     la = length(argtypes)
@@ -631,7 +671,7 @@ function abstract_call(@nospecialize(f), fargs::Union{Nothing,Vector{Any}}, argt
         end
         rt = builtin_tfunction(f, argtypes[2:end], sv)
         if f === getfield && isa(fargs, Vector{Any}) && length(argtypes) == 3 && isa(argtypes[3], Const) && isa(argtypes[3].val, Int) && argtypes[2] ⊑ Tuple
-            cti = precise_container_type(argtypes[2], vtypes, sv)
+            cti = precise_container_type(nothing, argtypes[2], vtypes, sv)
             idx = argtypes[3].val
             if 1 <= idx <= length(cti)
                 rt = unwrapva(cti[idx])
@@ -1116,6 +1156,8 @@ function typeinf_local(frame::InferenceState)
                     # only propagate information we know we can store
                     # and is valid inter-procedurally
                     rt = widenconst(rt)
+                elseif isa(rt, Const) && rt.actual
+                    rt = Const(rt.val)
                 end
                 if tchanged(rt, frame.bestguess)
                     # new (wider) return type for frame

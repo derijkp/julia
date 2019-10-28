@@ -1360,12 +1360,18 @@ let egal_tfunc
 end
 
 using Core.Compiler: PartialStruct, nfields_tfunc, sizeof_tfunc, sizeof_nothrow
+@test sizeof_tfunc(Const(Ptr)) === sizeof_tfunc(Union{Ptr, Int, Type{Ptr{Int8}}, Type{Int}}) === Const(Sys.WORD_SIZE ÷ 8)
+@test sizeof_tfunc(Type{Ptr}) === Int
+@test sizeof_nothrow(Union{Ptr, Int, Type{Ptr{Int8}}, Type{Int}})
+@test sizeof_nothrow(Const(Ptr))
+@test !sizeof_nothrow(Type{Ptr})
+@test !sizeof_nothrow(Type{Union{Ptr{Int}, Int}})
+@test !sizeof_nothrow(Const(Tuple))
 let PT = PartialStruct(Tuple{Int64,UInt64}, Any[Const(10, false), UInt64])
-    @test sizeof_tfunc(PT) === Const(16, false)
-    @test nfields_tfunc(PT) === Const(2, false)
-    @test sizeof_nothrow(PT) === true
+    @test sizeof_tfunc(PT) === Const(16)
+    @test nfields_tfunc(PT) === Const(2)
+    @test sizeof_nothrow(PT)
 end
-@test sizeof_nothrow(Const(Tuple)) === false
 
 using Core.Compiler: typeof_tfunc
 @test typeof_tfunc(Tuple{Vararg{Int}}) == Type{Tuple{Vararg{Int,N}}} where N
@@ -1453,6 +1459,21 @@ f_pure_add() = (1 + 1 == 2) ? true : "FAIL"
 @test Core.Compiler.getfield_tfunc(Const(Int), Const(:mutable)) == Const(false)
 @test Core.Compiler.getfield_tfunc(Const(Vector{Int}), Const(:mutable)) == Const(true)
 @test Core.Compiler.getfield_tfunc(DataType, Const(:mutable)) == Bool
+
+# getfield on abstract named tuples. issue #32698
+import Core.Compiler.getfield_tfunc
+@test getfield_tfunc(NamedTuple{(:id, :y), T} where {T <: Tuple{Int, Union{Float64, Missing}}},
+                     Const(:y)) == Union{Missing, Float64}
+@test getfield_tfunc(NamedTuple{(:id, :y), T} where {T <: Tuple{Int, Union{Float64, Missing}}},
+                     Const(2)) == Union{Missing, Float64}
+@test getfield_tfunc(NamedTuple{(:id, :y), T} where {T <: Tuple{Int, Union{Float64, Missing}}},
+                     Symbol) == Union{Missing, Float64, Int}
+@test getfield_tfunc(NamedTuple{<:Any, T} where {T <: Tuple{Int, Union{Float64, Missing}}},
+                     Symbol) == Union{Missing, Float64, Int}
+@test getfield_tfunc(NamedTuple{<:Any, T} where {T <: Tuple{Int, Union{Float64, Missing}}},
+                     Int) == Union{Missing, Float64, Int}
+@test getfield_tfunc(NamedTuple{<:Any, T} where {T <: Tuple{Int, Union{Float64, Missing}}},
+                     Const(:x)) == Union{Missing, Float64, Int}
 
 struct Foo_22708
     x::Ptr{Foo_22708}
@@ -1927,6 +1948,12 @@ Base.iterate(::Iterator27434, ::Any) = nothing
 @test @inferred(splat27434(Iterator27434(1, 2, 3))) == (1, 2, 3)
 @test @inferred((1, 2, 3) == (1, 2, 3))
 @test Core.Compiler.return_type(splat27434, Tuple{typeof(Iterators.repeated(1))}) == Union{}
+
+# issue #32465
+let rt = Base.return_types(splat27434, (NamedTuple{(:x,), Tuple{T}} where T,))
+    @test rt == Any[Tuple{Any}]
+    @test !Base.has_free_typevars(rt[1])
+end
 
 # issue #27078
 f27078(T::Type{S}) where {S} = isa(T, UnionAll) ? f27078(T.body) : T
@@ -2408,3 +2435,24 @@ let
     f = MixedKeyDict((Dict(2 => 7), Dict(5. => 11)))
     @test merge(+, d, e, f).dicts == (Dict(1 => 10, 2 => 7), Dict(4.0 => 2, 5.0 => 20))
 end
+
+# Issue #31974
+f31974(a::UnitRange) = (if first(a) <= last(a); f31974((first(a)+1):last(a)); end; a)
+f31974(n::Int) = f31974(1:n)
+# This query hangs if type inference improperly attempts to const prop
+# call cycles.
+@test code_typed(f31974, Tuple{Int}) !== nothing
+
+f_overly_abstract_complex() = Complex(Ref{Number}(1)[])
+@test Base.return_types(f_overly_abstract_complex, Tuple{}) == [Complex]
+
+# Issue 26724
+const IntRange = AbstractUnitRange{<:Integer}
+const DenseIdx = Union{IntRange,Integer}
+@inline foo_26724(result) =
+    (result...,)
+@inline foo_26724(result, i::Integer, I::DenseIdx...) =
+    foo_26724(result, I...)
+@inline foo_26724(result, r::IntRange, I::DenseIdx...) =
+    foo_26724((result..., length(r)), I...)
+@test @inferred(foo_26724((), 1:4, 1:5, 1:6)) === (4, 5, 6)
